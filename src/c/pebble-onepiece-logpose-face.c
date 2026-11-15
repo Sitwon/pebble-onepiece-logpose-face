@@ -76,13 +76,20 @@ static void prv_layout(Layer *root) {
   const int circum = min_dim * 31 / 100;      // 62 px on emery
 #endif
 
+#ifndef PBL_ROUND
+  // On the taller rectangular screen, the top orb reaches circum+r above the
+  // centroid but only circum/2+r below it. Drop the centroid by circum/4 so
+  // the top and bottom margins balance and the trio feels vertically centered.
+  c.y += circum / 4;
+#endif
+
   s_orb_center[ORB_TOP]   = GPoint(c.x, c.y - circum);
   s_orb_center[ORB_LEFT]  = GPoint(c.x - circum * 866 / 1000, c.y + circum / 2);
   s_orb_center[ORB_RIGHT] = GPoint(c.x + circum * 866 / 1000, c.y + circum / 2);
 
-  s_needle_front_len = s_orb_radius * 86 / 100;  // tips nearly touch the glass
+  s_needle_front_len = s_orb_radius * 95 / 100;  // tips nearly touch the glass
   s_needle_back_len = s_needle_front_len;        // equal-length white side
-  s_needle_half_w = MAX(3, s_orb_radius * 11 / 100);
+  s_needle_half_w = MAX(3, s_orb_radius * 219 / 1000);
   s_pivot_radius = s_needle_half_w + 2;
 }
 
