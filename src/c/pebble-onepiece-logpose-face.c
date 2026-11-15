@@ -1,8 +1,11 @@
 #include <pebble.h>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // New World Log Pose — three glass orbs on a full-screen wooden dome.
-//   top orb    : free needle, wobbles briefly each minute / on tap, then settles
+//   top orb    : free needle. Shaking the wrist makes all three needles spin
+//                for ~1s, wobble, then settle; the top needle settles pointing
+//                north (compass platforms) or in a random direction.
 //   bottom-left  : hour needle
 //   bottom-right : minute needle
 // ---------------------------------------------------------------------------
@@ -12,16 +15,33 @@
 #define ORB_RIGHT  2
 #define ORB_COUNT  3
 
-#define WOBBLE_FRAMES        36   // 36 * 50 ms = ~1.8 s, then the needle settles
+// Shake: tap event opens a short raw-accel window to confirm a real shake.
+#define CONFIRM_WINDOW_MS 600
+#define SHAKE_DELTA_MG    400   // min |delta| between consecutive samples
+#define SHAKE_SCORE_MIN   6     // spikes needed within the window
+#define ACCEL_SAMPLES_PER_BATCH 4
+
+// Needle animation state machine: spin -> ease into target -> wobble -> track.
+#define ANIM_FRAME_MS        33
+#define SPIN_FRAMES          30   // ~1 s of full-speed whirling
+#define SPIN_MIN_VEL_DEG     28   // per-frame spin speed range
+#define SPIN_MAX_VEL_DEG     42
+#define DECEL_FRAMES         12   // ease-out into the settled target
+#define WOBBLE_FRAMES        36   // decaying sine around the target
 #define WOBBLE_INTERVAL_MS   50
 #define WOBBLE_AMPLITUDE_DEG 26
-#define NEEDLE_REST_DEG      225  // free needle at rest points down-left
+#define NEEDLE_REST_DEG      225  // rest heading before the first shake
+
+#define TRACK_MS             2000 // compass keeps tracking 2 s after settle
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef ABS
+#define ABS(a) ((a) < 0 ? -(a) : (a))
 #endif
 
 // Palette — hex values chosen to land on pleasing Pebble 64-color entries
@@ -34,6 +54,14 @@
 #define COLOR_ORB_GLOW      GColorFromHEX(0x55AA55)  // deeper lower half
 #define COLOR_ORB_SHEEN     GColorFromHEX(0xAAFFAA)  // pale mint sheen
 #define COLOR_NEEDLE_RED    GColorFromHEX(0x8E1F3F)
+
+typedef enum {
+  ANIM_IDLE,    // needles settled; minute ticks may re-wobble
+  ANIM_SPIN,    // all needles whirling
+  ANIM_DECEL,   // easing into each needle's target
+  ANIM_WOBBLE,  // decaying wobble around the target
+  ANIM_TRACK,   // top needle keeps tracking north for TRACK_MS, then freezes
+} AnimState;
 
 static Window *s_window;
 static Layer *s_bg_layer;
@@ -55,8 +83,35 @@ static int s_hour_angle_deg;
 static int s_min_angle_deg;
 static bool s_time_ready;
 
-static AppTimer *s_wobble_timer;
-static int s_wobble_frame;  // -1 while settled
+// Animation state
+static AnimState s_anim_state = ANIM_IDLE;
+static AppTimer *s_anim_timer;
+static int s_anim_frame;                    // frame counter for SPIN/DECEL
+static int s_wobble_frame;                  // frame counter for ANIM_WOBBLE
+static int32_t s_spin_deg[ORB_COUNT];       // free-spinning angles (trigangle)
+static int32_t s_spin_vel_trig[ORB_COUNT];  // per-needle spin speed & direction
+static int32_t s_decel_start[ORB_COUNT];    // angle when decel began
+static int32_t s_decel_target[ORB_COUNT];   // settled target
+static int32_t s_top_rest_trig;             // top needle's frozen rest angle
+
+// Shake confirmation
+static AppTimer *s_confirm_timer;
+static int s_shake_score;
+static int16_t s_last_x, s_last_y, s_last_z;  // previous sample (per-axis)
+static bool s_have_baseline;
+
+// Compass (only meaningful on PBL_COMPASS platforms)
+static bool s_compass_active;
+static bool s_heading_valid;
+static int32_t s_heading_trig;  // on-screen rotation for "pointing north"
+
+// Forward declarations (the animation loop and sensor handlers interleave)
+static void prv_anim_tick(void *data);
+static void prv_capture_heading(void *data);
+static void prv_start_wobble(void);
+static void prv_start_spin(void);
+static void prv_tap_handler(AccelAxisType axis, int32_t direction);
+static void prv_compass_handler(CompassHeadingData heading);
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -213,26 +268,76 @@ static void prv_draw_needle(GContext *ctx, GPoint c, int32_t angle) {
   graphics_fill_circle(ctx, c, s_pivot_radius - 1);
 }
 
+// Settled target of a needle (trigangle, 0 = up, clockwise).
+static int32_t prv_target_trig(int orb) {
+  if (orb == ORB_TOP) {
+    if (s_compass_active && s_heading_valid) {
+      return s_heading_trig;
+    }
+    return s_top_rest_trig;
+  }
+  if (orb == ORB_LEFT) {
+    return DEG_TO_TRIGANGLE(s_hour_angle_deg);
+  }
+  return DEG_TO_TRIGANGLE(s_min_angle_deg);
+}
+
+// Shortest signed trigangle difference from a to b.
+static int32_t prv_ang_delta(int32_t from, int32_t to) {
+  int32_t d = (to - from) % TRIG_MAX_ANGLE;
+  if (d > TRIG_MAX_ANGLE / 2) {
+    d -= TRIG_MAX_ANGLE;
+  } else if (d < -TRIG_MAX_ANGLE / 2) {
+    d += TRIG_MAX_ANGLE;
+  }
+  return d;
+}
+
 static void prv_fg_update_proc(Layer *layer, GContext *ctx) {
   if (!s_time_ready) {
     return;
   }
 
-  int32_t rest_angle = DEG_TO_TRIGANGLE(NEEDLE_REST_DEG);
-  if (s_wobble_frame >= 0) {
+  // Wobble offset shared by all needles during ANIM_WOBBLE.
+  int32_t wob = 0;
+  if (s_anim_state == ANIM_WOBBLE) {
     const int32_t amp = (int32_t)DEG_TO_TRIGANGLE(WOBBLE_AMPLITUDE_DEG) *
                         (WOBBLE_FRAMES - s_wobble_frame) / WOBBLE_FRAMES;
-    const int32_t wobble = amp * sin_lookup(s_wobble_frame * 3300) / TRIG_MAX_RATIO;
-    rest_angle += wobble;
+    wob = amp * sin_lookup(s_wobble_frame * 3300) / TRIG_MAX_RATIO;
   }
 
-  prv_draw_needle(ctx, s_orb_center[ORB_TOP], rest_angle);
-  prv_draw_needle(ctx, s_orb_center[ORB_LEFT], DEG_TO_TRIGANGLE(s_hour_angle_deg));
-  prv_draw_needle(ctx, s_orb_center[ORB_RIGHT], DEG_TO_TRIGANGLE(s_min_angle_deg));
+  for (int orb = 0; orb < ORB_COUNT; orb++) {
+    int32_t angle;
+    switch (s_anim_state) {
+      case ANIM_SPIN:
+        angle = s_spin_deg[orb];
+        break;
+      case ANIM_DECEL: {
+        // Ease-out from the spin angle into the target along the short arc.
+        const int p = s_anim_frame * 100 / DECEL_FRAMES;   // 0..100
+        const int e = p * (200 - p) / 100;                 // ease-out quad
+        angle = s_decel_start[orb] +
+                prv_ang_delta(s_decel_start[orb], s_decel_target[orb]) * e / 100;
+        break;
+      }
+      case ANIM_TRACK:
+        // Only the top needle tracks; hour/min stay settled.
+        if (orb == ORB_TOP && s_heading_valid) {
+          angle = s_heading_trig;
+        } else {
+          angle = prv_target_trig(orb);
+        }
+        break;
+      default:  // ANIM_IDLE / ANIM_WOBBLE
+        angle = prv_target_trig(orb) + wob;
+        break;
+    }
+    prv_draw_needle(ctx, s_orb_center[orb], angle);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Time & animation
+// Time
 // ---------------------------------------------------------------------------
 
 static void prv_update_time(void) {
@@ -246,33 +351,188 @@ static void prv_update_time(void) {
   }
 }
 
-static void prv_wobble_tick(void *data) {
-  s_wobble_timer = NULL;
-  s_wobble_frame++;
-  if (s_wobble_frame < WOBBLE_FRAMES) {
-    layer_mark_dirty(s_fg_layer);
-    s_wobble_timer = app_timer_register(WOBBLE_INTERVAL_MS, prv_wobble_tick, NULL);
-  } else {
-    s_wobble_frame = -1;
-    layer_mark_dirty(s_fg_layer);
-  }
-}
-
-static void prv_start_wobble(void) {
-  if (s_wobble_timer != NULL) {
-    return;
-  }
-  s_wobble_frame = 0;
-  s_wobble_timer = app_timer_register(WOBBLE_INTERVAL_MS, prv_wobble_tick, NULL);
-}
-
 static void prv_tick_handler(struct tm *tick_time, TimeUnits units) {
   prv_update_time();
+  // Minute boundary: brief jiggle around the settled positions.
   prv_start_wobble();
+}
+
+// ---------------------------------------------------------------------------
+// Needle animation: spin -> decel -> wobble -> (track north) -> idle
+// ---------------------------------------------------------------------------
+
+static void prv_anim_tick(void *data) {
+  s_anim_timer = NULL;
+  int next_ms = ANIM_FRAME_MS;
+
+  switch (s_anim_state) {
+    case ANIM_SPIN:
+      for (int orb = 0; orb < ORB_COUNT; orb++) {
+        s_spin_deg[orb] += s_spin_vel_trig[orb];
+      }
+      s_anim_frame++;
+      if (s_anim_frame >= SPIN_FRAMES) {
+        for (int orb = 0; orb < ORB_COUNT; orb++) {
+          s_decel_start[orb] = s_spin_deg[orb];
+          s_decel_target[orb] = prv_target_trig(orb);
+        }
+        s_anim_state = ANIM_DECEL;
+        s_anim_frame = 0;
+      }
+      break;
+
+    case ANIM_DECEL:
+      s_anim_frame++;
+      if (s_anim_frame >= DECEL_FRAMES) {
+        s_anim_state = ANIM_WOBBLE;
+        s_wobble_frame = 0;
+        next_ms = WOBBLE_INTERVAL_MS;
+      }
+      break;
+
+    case ANIM_WOBBLE:
+      s_wobble_frame++;
+      if (s_wobble_frame > WOBBLE_FRAMES) {
+        if (s_compass_active) {
+          // Keep tracking north for TRACK_MS, then freeze the heading.
+          s_anim_timer = app_timer_register(TRACK_MS, prv_capture_heading, NULL);
+          layer_mark_dirty(s_fg_layer);
+          return;
+        }
+        s_top_rest_trig = prv_target_trig(ORB_TOP);  // lock in the random rest
+        s_anim_state = ANIM_IDLE;
+        layer_mark_dirty(s_fg_layer);
+        return;
+      }
+      break;
+
+    default:
+      return;
+  }
+
+  layer_mark_dirty(s_fg_layer);
+  s_anim_timer = app_timer_register(next_ms, prv_anim_tick, NULL);
+}
+
+static void prv_capture_heading(void *data) {
+  s_anim_timer = NULL;
+  if (s_heading_valid) {
+    s_top_rest_trig = s_heading_trig;  // freeze where the needle stands
+  }
+  compass_service_unsubscribe();
+  s_compass_active = false;
+  s_heading_valid = false;
+  s_anim_state = ANIM_IDLE;
+  layer_mark_dirty(s_fg_layer);
+}
+
+// Minute-tick wobble: needles jiggle briefly around their settled positions.
+static void prv_start_wobble(void) {
+  if (s_anim_state != ANIM_IDLE) {
+    return;
+  }
+  s_anim_state = ANIM_WOBBLE;
+  s_wobble_frame = 0;
+  s_anim_timer = app_timer_register(WOBBLE_INTERVAL_MS, prv_anim_tick, NULL);
+}
+
+// Full shake sequence: whirl ~1 s, wobble, then (on compass platforms) track.
+static void prv_start_spin(void) {
+  if (s_anim_state != ANIM_IDLE) {
+    return;
+  }
+
+#ifndef PBL_COMPASS
+  // No compass: every shake settles the top needle in a random direction.
+  s_top_rest_trig = (int32_t)((uint32_t)rand() % TRIG_MAX_ANGLE);
+#else
+  // Fresh heading for the settle: subscribe the compass for the animation.
+  s_heading_valid = false;
+  s_compass_active = true;
+  compass_service_subscribe(prv_compass_handler);
+#endif
+
+  s_spin_deg[ORB_TOP] = s_top_rest_trig;
+  s_spin_deg[ORB_LEFT] = DEG_TO_TRIGANGLE(s_hour_angle_deg);
+  s_spin_deg[ORB_RIGHT] = DEG_TO_TRIGANGLE(s_min_angle_deg);
+
+  // Each needle whirls at a random speed in a random direction.
+  for (int orb = 0; orb < ORB_COUNT; orb++) {
+    const int vel_deg = SPIN_MIN_VEL_DEG +
+                        rand() % (SPIN_MAX_VEL_DEG - SPIN_MIN_VEL_DEG + 1);
+    const int dir = (rand() % 2) ? 1 : -1;
+    s_spin_vel_trig[orb] = dir * vel_deg * TRIG_MAX_ANGLE / 360;
+  }
+
+  s_anim_state = ANIM_SPIN;
+  s_anim_frame = 0;
+  s_anim_timer = app_timer_register(ANIM_FRAME_MS, prv_anim_tick, NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Shake confirmation: tap event -> 600 ms raw-accel window
+// ---------------------------------------------------------------------------
+
+static void prv_confirm_timeout(void *data) {
+  s_confirm_timer = NULL;
+  accel_data_service_unsubscribe();
+  accel_tap_service_subscribe(prv_tap_handler);
+}
+
+static void prv_accel_data_handler(AccelData *data, uint32_t num_samples) {
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "accel batch: %u samples", (unsigned)num_samples);
+  if (s_anim_state != ANIM_IDLE) {
+    return;
+  }
+  for (uint32_t i = 0; i < num_samples; i++) {
+    if (data[i].did_vibrate) {
+      continue;
+    }
+    // Per-axis deltas catch sign-flipping oscillation, which a plain
+    // magnitude comparison would miss.
+    const int delta = ABS(data[i].x - s_last_x) + ABS(data[i].y - s_last_y) +
+                      ABS(data[i].z - s_last_z);
+    if (s_have_baseline) {
+      if (delta > SHAKE_DELTA_MG) {
+        s_shake_score++;
+        if (s_shake_score >= SHAKE_SCORE_MIN) {
+          APP_LOG(APP_LOG_LEVEL_DEBUG, "shake confirmed (score %d)", s_shake_score);
+          prv_start_spin();
+          return;
+        }
+      }
+    }
+    s_last_x = data[i].x;
+    s_last_y = data[i].y;
+    s_last_z = data[i].z;
+    s_have_baseline = true;
+  }
 }
 
 static void prv_tap_handler(AccelAxisType axis, int32_t direction) {
-  prv_start_wobble();
+  if (s_anim_state != ANIM_IDLE || s_confirm_timer != NULL) {
+    return;
+  }
+  // Swap the cheap tap detector for a short raw-sampling window and verify
+  // the jolt was really a shake (rapid, repeated direction changes).
+  accel_tap_service_unsubscribe();
+  s_shake_score = 0;
+  s_have_baseline = false;
+  accel_service_set_sampling_rate(ACCEL_SAMPLING_25HZ);
+  accel_data_service_subscribe(ACCEL_SAMPLES_PER_BATCH, prv_accel_data_handler);
+  s_confirm_timer = app_timer_register(CONFIRM_WINDOW_MS, prv_confirm_timeout, NULL);
+}
+
+static void prv_compass_handler(CompassHeadingData heading) {
+  if (heading.compass_status == CompassStatusDataInvalid ||
+      heading.compass_status == CompassStatusUnavailable) {
+    return;
+  }
+  s_heading_trig = heading.magnetic_heading;  // needle rotation for north
+  s_heading_valid = true;
+  if (s_anim_state == ANIM_TRACK) {
+    layer_mark_dirty(s_fg_layer);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +574,9 @@ static void prv_window_unload(Window *window) {
 }
 
 static void prv_init(void) {
-  s_wobble_frame = -1;
+  s_top_rest_trig = DEG_TO_TRIGANGLE(NEEDLE_REST_DEG);
+  s_heading_valid = false;
+  srand((unsigned int)time(NULL));
 
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers) {
@@ -333,9 +595,16 @@ static void prv_init(void) {
 }
 
 static void prv_deinit(void) {
-  if (s_wobble_timer) {
-    app_timer_cancel(s_wobble_timer);
+  if (s_anim_timer) {
+    app_timer_cancel(s_anim_timer);
   }
+  if (s_confirm_timer) {
+    app_timer_cancel(s_confirm_timer);
+  }
+  if (s_compass_active) {
+    compass_service_unsubscribe();
+  }
+  accel_data_service_unsubscribe();
   accel_tap_service_unsubscribe();
   tick_timer_service_unsubscribe();
   window_destroy(s_window);
