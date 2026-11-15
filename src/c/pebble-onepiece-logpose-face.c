@@ -32,7 +32,7 @@
 #define WOBBLE_AMPLITUDE_DEG 26
 #define NEEDLE_REST_DEG      225  // rest heading before the first shake
 
-#define TRACK_MS             2000 // compass keeps tracking 2 s after settle
+#define TRACK_MS             15000 // compass keeps tracking 15 s after settle
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -406,8 +406,8 @@ static void prv_anim_tick(void *data) {
       if (s_wobble_frame > WOBBLE_FRAMES) {
         if (s_compass_active) {
           // Keep tracking north for TRACK_MS, then freeze the heading.
+          s_anim_state = ANIM_TRACK;
           s_anim_timer = app_timer_register(TRACK_MS, prv_capture_heading, NULL);
-          layer_mark_dirty(s_fg_layer);
           return;
         }
         s_top_rest_trig = prv_target_trig(ORB_TOP);  // lock in the random rest
