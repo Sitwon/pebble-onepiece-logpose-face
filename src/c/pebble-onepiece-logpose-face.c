@@ -15,12 +15,6 @@
 #define ORB_RIGHT  2
 #define ORB_COUNT  3
 
-// Shake: tap event opens a short raw-accel window to confirm a real shake.
-#define CONFIRM_WINDOW_MS 600
-#define SHAKE_DELTA_MG    400   // min |delta| between consecutive samples
-#define SHAKE_SCORE_MIN   6     // spikes needed within the window
-#define ACCEL_SAMPLES_PER_BATCH 4
-
 // Needle animation state machine: spin -> ease into target -> wobble -> track.
 #define ANIM_FRAME_MS        33
 #define SPIN_FRAMES          30   // ~1 s of full-speed whirling
@@ -93,12 +87,6 @@ static int32_t s_spin_vel_trig[ORB_COUNT];  // per-needle spin speed & direction
 static int32_t s_decel_start[ORB_COUNT];    // angle when decel began
 static int32_t s_decel_target[ORB_COUNT];   // settled target
 static int32_t s_top_rest_trig;             // top needle's frozen rest angle
-
-// Shake confirmation
-static AppTimer *s_confirm_timer;
-static int s_shake_score;
-static int16_t s_last_x, s_last_y, s_last_z;  // previous sample (per-axis)
-static bool s_have_baseline;
 
 // Compass (only meaningful on PBL_COMPASS platforms)
 static bool s_compass_active;
@@ -481,57 +469,14 @@ static void prv_start_spin(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Shake confirmation: tap event -> 600 ms raw-accel window
+// Tap-to-spin: any tap while idle triggers the spin animation.
 // ---------------------------------------------------------------------------
 
-static void prv_confirm_timeout(void *data) {
-  s_confirm_timer = NULL;
-  accel_data_service_unsubscribe();
-  accel_tap_service_subscribe(prv_tap_handler);
-}
-
-static void prv_accel_data_handler(AccelData *data, uint32_t num_samples) {
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "accel batch: %u samples", (unsigned)num_samples);
+static void prv_tap_handler(AccelAxisType axis, int32_t direction) {
   if (s_anim_state != ANIM_IDLE) {
     return;
   }
-  for (uint32_t i = 0; i < num_samples; i++) {
-    if (data[i].did_vibrate) {
-      continue;
-    }
-    // Per-axis deltas catch sign-flipping oscillation, which a plain
-    // magnitude comparison would miss.
-    const int delta = ABS(data[i].x - s_last_x) + ABS(data[i].y - s_last_y) +
-                      ABS(data[i].z - s_last_z);
-    if (s_have_baseline) {
-      if (delta > SHAKE_DELTA_MG) {
-        s_shake_score++;
-        if (s_shake_score >= SHAKE_SCORE_MIN) {
-          APP_LOG(APP_LOG_LEVEL_DEBUG, "shake confirmed (score %d)", s_shake_score);
-          prv_start_spin();
-          return;
-        }
-      }
-    }
-    s_last_x = data[i].x;
-    s_last_y = data[i].y;
-    s_last_z = data[i].z;
-    s_have_baseline = true;
-  }
-}
-
-static void prv_tap_handler(AccelAxisType axis, int32_t direction) {
-  if (s_anim_state != ANIM_IDLE || s_confirm_timer != NULL) {
-    return;
-  }
-  // Swap the cheap tap detector for a short raw-sampling window and verify
-  // the jolt was really a shake (rapid, repeated direction changes).
-  accel_tap_service_unsubscribe();
-  s_shake_score = 0;
-  s_have_baseline = false;
-  accel_service_set_sampling_rate(ACCEL_SAMPLING_25HZ);
-  accel_data_service_subscribe(ACCEL_SAMPLES_PER_BATCH, prv_accel_data_handler);
-  s_confirm_timer = app_timer_register(CONFIRM_WINDOW_MS, prv_confirm_timeout, NULL);
+  prv_start_spin();
 }
 
 static void prv_compass_handler(CompassHeadingData heading) {
@@ -609,13 +554,9 @@ static void prv_deinit(void) {
   if (s_anim_timer) {
     app_timer_cancel(s_anim_timer);
   }
-  if (s_confirm_timer) {
-    app_timer_cancel(s_confirm_timer);
-  }
   if (s_compass_active) {
     compass_service_unsubscribe();
   }
-  accel_data_service_unsubscribe();
   accel_tap_service_unsubscribe();
   tick_timer_service_unsubscribe();
   window_destroy(s_window);
