@@ -223,6 +223,12 @@ static void prv_draw_orb(GContext *ctx, GPoint c, int r) {
   graphics_context_set_fill_color(ctx, COLOR_ORB_GLOW);
   graphics_fill_radial(ctx, circle_rect, GOvalScaleModeFitCircle, 2,
                        DEG_TO_TRIGANGLE(95), DEG_TO_TRIGANGLE(265));
+}
+
+// Specular glass details drawn on top of the needles, so the reflections
+// appear in front of what's inside the orb.
+static void prv_draw_orb_glass_front(GContext *ctx, GPoint c, int r) {
+  const GRect circle_rect = GRect(c.x - r, c.y - r, 2 * r, 2 * r);
 
   // Light sheen band in the upper left.
   graphics_context_set_fill_color(ctx, COLOR_ORB_SHEEN);
@@ -333,6 +339,11 @@ static void prv_fg_update_proc(Layer *layer, GContext *ctx) {
         break;
     }
     prv_draw_needle(ctx, s_orb_center[orb], angle);
+  }
+
+  // Glass reflections render in front of the needles.
+  for (int orb = 0; orb < ORB_COUNT; orb++) {
+    prv_draw_orb_glass_front(ctx, s_orb_center[orb], s_orb_radius);
   }
 }
 
