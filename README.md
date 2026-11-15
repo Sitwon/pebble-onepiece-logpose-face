@@ -1,5 +1,10 @@
 # pebble-onepiece-logpose-face
 
+> **Unofficial, fan-made project.** This watchface is not affiliated with,
+> endorsed by, or connected to Toei Animation, Shueisha, or any One Piece
+> intellectual property holder. One Piece and related marks are trademarks of
+> their respective owners.
+
 A **New World Log Pose** watchface for the Pebble Time 2 (emery) and Pebble
 Round 2 (gabbro), inspired by One Piece. The whole screen is the log pose:
 a wooden dome with three glass orbs — the top needle wobbles and settles like
