@@ -1,0 +1,24 @@
+{
+  "name": "pebble-onepiece-logpose-face",
+  "author": "Sitwon",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Log Pose",
+    "uuid": "af1926d9-5e60-43f1-bd2a-c417fb7438a5",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery",
+      "gabbro"
+    ],
+    "watchapp": {
+      "watchface": true
+    },
+    "resources": {
+      "media": []
+    }
+  }
+}
