@@ -82,6 +82,7 @@ static AnimState s_anim_state = ANIM_IDLE;
 static AppTimer *s_anim_timer;
 static int s_anim_frame;                    // frame counter for SPIN/DECEL
 static int s_wobble_frame;                  // frame counter for ANIM_WOBBLE
+static uint8_t s_wobble_mask;               // bitmask: which needles wobble
 static int32_t s_spin_deg[ORB_COUNT];       // free-spinning angles (trigangle)
 static int32_t s_spin_vel_trig[ORB_COUNT];  // per-needle spin speed & direction
 static int32_t s_decel_start[ORB_COUNT];    // angle when decel began
@@ -96,7 +97,7 @@ static int32_t s_heading_trig;  // on-screen rotation for "pointing north"
 // Forward declarations (the animation loop and sensor handlers interleave)
 static void prv_anim_tick(void *data);
 static void prv_capture_heading(void *data);
-static void prv_start_wobble(void);
+static void prv_start_wobble(uint8_t mask);
 static void prv_start_spin(void);
 static void prv_tap_handler(AccelAxisType axis, int32_t direction);
 static void prv_compass_handler(CompassHeadingData heading);
@@ -292,16 +293,14 @@ static void prv_fg_update_proc(Layer *layer, GContext *ctx) {
     return;
   }
 
-  // Wobble offset shared by all needles during ANIM_WOBBLE.
-  int32_t wob = 0;
-  if (s_anim_state == ANIM_WOBBLE) {
-    const int32_t amp = (int32_t)DEG_TO_TRIGANGLE(WOBBLE_AMPLITUDE_DEG) *
-                        (WOBBLE_FRAMES - s_wobble_frame) / WOBBLE_FRAMES;
-    wob = amp * sin_lookup(s_wobble_frame * 3300) / TRIG_MAX_RATIO;
-  }
-
   for (int orb = 0; orb < ORB_COUNT; orb++) {
     int32_t angle;
+    int32_t wob = 0;
+    if (s_anim_state == ANIM_WOBBLE && (s_wobble_mask & (1 << orb))) {
+      const int32_t amp = (int32_t)DEG_TO_TRIGANGLE(WOBBLE_AMPLITUDE_DEG) *
+                          (WOBBLE_FRAMES - s_wobble_frame) / WOBBLE_FRAMES;
+      wob = amp * sin_lookup(s_wobble_frame * 3300) / TRIG_MAX_RATIO;
+    }
     switch (s_anim_state) {
       case ANIM_SPIN:
         angle = s_spin_deg[orb];
@@ -353,7 +352,7 @@ static void prv_update_time(void) {
 static void prv_tick_handler(struct tm *tick_time, TimeUnits units) {
   prv_update_time();
   // Minute boundary: brief jiggle around the settled positions.
-  prv_start_wobble();
+  prv_start_wobble(0x07);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,20 +415,24 @@ static void prv_anim_tick(void *data) {
 static void prv_capture_heading(void *data) {
   s_anim_timer = NULL;
   if (s_heading_valid) {
-    s_top_rest_trig = s_heading_trig;  // freeze where the needle stands
+    s_top_rest_trig = s_heading_trig;
   }
   compass_service_unsubscribe();
   s_compass_active = false;
   s_heading_valid = false;
   s_anim_state = ANIM_IDLE;
+
+  // Brief wobble on the top needle as it "locks in" its final position.
+  prv_start_wobble(0x01);  // only ORB_TOP
   layer_mark_dirty(s_fg_layer);
 }
 
 // Minute-tick wobble: needles jiggle briefly around their settled positions.
-static void prv_start_wobble(void) {
+static void prv_start_wobble(uint8_t mask) {
   if (s_anim_state != ANIM_IDLE) {
     return;
   }
+  s_wobble_mask = mask;
   s_anim_state = ANIM_WOBBLE;
   s_wobble_frame = 0;
   s_anim_timer = app_timer_register(WOBBLE_INTERVAL_MS, prv_anim_tick, NULL);
@@ -542,7 +545,7 @@ static void prv_init(void) {
   window_stack_push(s_window, true);
 
   prv_update_time();
-  prv_start_wobble();  // settle animation on launch
+  prv_start_wobble(0x07);  // settle animation on launch
 
   // Yellow backlight tint (emery/gabbro RGB backlight; no-op on monochrome).
   light_set_color_rgb888(0xFFF0A0);
