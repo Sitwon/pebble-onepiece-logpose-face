@@ -545,7 +545,7 @@ static void prv_init(void) {
   prv_start_wobble();  // settle animation on launch
 
   // Yellow backlight tint (emery/gabbro RGB backlight; no-op on monochrome).
-  light_set_color(GColorYellow);
+  light_set_color_rgb888(0xFFF0A0);
 
   tick_timer_service_subscribe(MINUTE_UNIT, prv_tick_handler);
   accel_tap_service_subscribe(prv_tap_handler);
