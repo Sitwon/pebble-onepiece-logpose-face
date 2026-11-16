@@ -26,7 +26,7 @@
 #define WOBBLE_AMPLITUDE_DEG 26
 #define NEEDLE_REST_DEG      225  // rest heading before the first shake
 
-#define TRACK_MS             10000 // compass keeps tracking 10 s after settle
+#define TRACK_MS             5000 // compass keeps tracking 5 s after settle
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
